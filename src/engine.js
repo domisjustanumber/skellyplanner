@@ -1,0 +1,742 @@
+// Coverage engine for the room planner. Pure functions; used by the page and by node tests.
+const ENGINE = (() => {
+  const P = 0.003; // mm pixel pitch
+  const SENSORS = { ar0234: { name: "AR0234", w: 1920, h: 1200 }, ov9281: { name: "OV9281", w: 1280, h: 800 } };
+  const STOCK = [2.8, 3.6, 6.0];
+
+  function optics(sensor, orient, f, o) {
+    const sn = SENSORS[sensor];
+    const pxV = orient === "portrait" ? sn.w : sn.h;
+    const pxH = orient === "portrait" ? sn.h : sn.w;
+    return {
+      near: o.cov * f / (pxV * P),          // m, full body fits from here
+      far: o.ph * f / (o.crop * P),         // m, enough pixels up to here
+      tanHalf: pxH * P / (2 * f)            // tan of half horizontal FOV
+    };
+  }
+
+  // Measured with RTMW on CMU Panoptic (see HANDOFF.md): a camera 60-120 degrees round from the subject's
+  // front reads the far side of the body about three times worse than the near side, and pairs with both
+  // cameras within 60 degrees of the front triangulate best.
+  const SIDE = [60, 120], FRONT = 60;
+  // Owner's rule: a spot also needs one camera within STRAIGHT degrees of the way the subject faces, for every
+  // facing in the turning arc. Measured single-view error is flat out to about 45 degrees (18.8-20.8 mm).
+  const STRAIGHT = 45;
+  // A wrist behind the back had a clear line of sight from 91-100% of views 90 degrees or more round from the
+  // subject's front, 44% at 75-90 and 8-21% nearer the front (CMU Panoptic, torso box from the 3D shoulders and
+  // hips; see HANDOFF.md). So a camera at least REAR degrees from the way the subject faces sees the back.
+  const REAR = 90;
+  // One blocked view takes out every camera within BLOCK degrees round from one of them, seen from the spot:
+  // about what a person 0.5 m wide hides standing 1 m from the subject. Judgement, not measured.
+  const BLOCK = 30, CAP = 20;   // CAP: most cameras in a plan
+  const STEP = 0.5;   // m between the camera positions tried along each wall
+  const AIMS = [[0, 0], [0, -1], [0, 1], [-1, 0], [1, 0]];   // aim targets: the volume centre, then the middle of each edge
+  // No two cameras stand closer than GAP m: about the floor a light stand takes, and close enough that a corner
+  // and the wall spots next to it (0.45 m away in a room a whole number of metres wide) can both be used. Views
+  // that close are under 10 degrees apart from 3 m away, so they never pair with each other. Judgement.
+  const GAP = 0.4;
+  const apart = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) > GAP - 1e-6;
+  // Search effort in plan(), set by run time (judgement): every volume position grows its own layout up to WIDE
+  // cameras; best() scores every camera on every QUICK-th row and column of points and the best LOOK of them on all.
+  const WIDE = 6, LOOK = 5, QUICK = 3;
+  // A camera is face-on when it stands within AHEAD degrees of dead ahead of the subject, seen from the volume
+  // centre (wall spots are STEP m apart, so a corner is rarely at 45 degrees exactly). Judgement.
+  const AHEAD = 10;
+  // Where pose models have seen people from. SHARE: % of the 401,394 people in RTMW's training data (AI Challenger
+  // and COCO) seen from each 15 degree band round from their front, 0-15 to 165-180. ERR: RTMW-l's median error (mm)
+  // on one view from each band (CMU Panoptic, single people). The two agree in front (most views, least error) and at
+  // the side (few, worst) but not behind: 2% of training views, yet read as well as the front. So a band is worth its
+  // share times how well it is read against the front (ERR[0] / ERR). NEARBY: a camera stands for the views within
+  // this many degrees of it (fits from different sources agree to 14-16 degrees at p90, and cameras under 30 degrees
+  // apart triangulate worse). See HANDOFF.md.
+  const SHARE = [39.4, 19, 11.8, 7.7, 5.3, 3.7, 2.8, 2.3, 2.0, 1.8, 1.8, 2.4], ERR = [17.5, 17.7, 18.0, 19.9, 22.3, 26.7, 26.1, 22.9, 20.7, 18.2, 16.7, 14.7];
+  const NEARBY = 15, CELL = 5, CELLS = 360 / CELL;
+
+  // Directions the subject faces across the turning arc, degrees from the front wall (positive = towards the
+  // right wall), centred on o.face: 0 faces the front wall, 45 the front-right corner.
+  function facings(o) {
+    const T = Math.min(360, o.turn || 0), out = [];
+    for (let f = -T / 2; f <= T / 2 + 1e-9 && out.length < 24; f += 15) out.push((o.face || 0) + f);
+    return out;
+  }
+  const wrap = (a) => ((a % 360) + 540) % 360 - 180;
+
+  // For a camera seen from a point at bearing th (degrees, 0 = towards the front wall, positive = the
+  // subject's left): bitmasks of the facings in which it reads the body's left side, reads its right side,
+  // is in front, is straight on (within STRAIGHT), and sees the back (REAR or more round). To ask for a
+  // straight-on camera at the mid-arc facing only, set st to all facings after the loop when
+  // Math.abs(wrap(th - (F[0] + F[F.length - 1]) / 2)) <= STRAIGHT.
+  function masks(th, F) {
+    let L = 0, R = 0, front = 0, st = 0, rear = 0;
+    F.forEach((f, k) => {
+      const r = wrap(th - f), a = Math.abs(r), side = a > SIDE[0] + 1e-6 && a < SIDE[1] - 1e-6;
+      if (!(side && r < 0)) L |= 1 << k;
+      if (!(side && r > 0)) R |= 1 << k;
+      if (a <= FRONT + 1e-6) front |= 1 << k;
+      if (a <= STRAIGHT + 1e-6) st |= 1 << k;
+      if (a >= REAR - 1e-6) rear |= 1 << k;
+    });
+    return [L, R, front, st, rear];
+  }
+  const bits = (v) => { v -= (v >> 1) & 0x55555555; v = (v & 0x33333333) + ((v >> 2) & 0x33333333); return (((v + (v >> 4)) & 0x0f0f0f0f) * 0x01010101) >> 24; };
+  const bearing = (c, x, y) => Math.atan2(c.x - x, y - c.y) * 180 / Math.PI;
+
+  function grid(o, n) {
+    const pts = [];
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      pts.push([(-0.5 + i / (n - 1)) * o.volW, (-0.5 + j / (n - 1)) * o.volD]);
+    }
+    return pts;
+  }
+
+  function sees(cam, op, x, y) {
+    const vx = x - cam.x, vy = y - cam.y;
+    const z = vx * cam.ax + vy * cam.ay;            // depth along axis
+    if (z < op.near || z > op.far) return false;
+    const lat = Math.abs(vx * -cam.ay + vy * cam.ax);
+    return lat <= z * op.tanHalf;
+  }
+
+  // Is the view at bearing b lost when the view at bearing a is blocked?
+  const blocked = (a, b) => { let d = b - a; if (d < -1e-6) d += 360; return d < BLOCK + 1e-6; };
+
+  // Per-point state: 0 unseen, 1 seen by one camera, 2 seen by several but not covered, 3 covered,
+  // 4 covered and the back seen, 5 covered and the back seen by two cameras inside the pair-angle band.
+  // Covered: for every facing, each side of the body is read by two cameras inside the pair-angle band, and
+  // one camera is straight on.
+  // Back seen / back triangulated: for every facing, one camera / two cameras in the band REAR or more round.
+  // Hands behind the back need the second: one clear view gives a 2D point, not a 3D one (see HANDOFF.md).
+  // bare: skip the blocked-view share.
+  function evaluate(cams, op, o, pts, bare) {
+    const F = facings(o), full = (1 << F.length) - 1;
+    let good = 0, front = 0, spare = 0, rear = 0, hands = 0;
+    const state = pts.map(([x, y], q) => {
+      // c.v: a camera's views of these points worked out beforehand (to try many layouts of the same cameras)
+      const v = cams.map((c) => (c.v ? c.v[q] : sees(c, op, x, y) && { th: bearing(c, x, y), m: masks(bearing(c, x, y), F) })).filter(Boolean);
+      // covered, the front-pair facings, back seen and back triangulated, from the views left when the view at
+      // bearing b is blocked
+      const cover = (b) => {
+        const u = b == null ? v : v.filter((c) => !blocked(b, c.th));
+        let L = 0, R = 0, fr = 0, H = 0, S = 0, B = 0;
+        for (const c of u) { S |= c.m[3]; B |= c.m[4]; }
+        for (let i = 0; i < u.length; i++) for (let j = i + 1; j < u.length; j++) {
+          const d = Math.abs(u[i].th - u[j].th), a = d > 180 ? 360 - d : d;
+          if (a >= o.minA - 1e-6 && a <= o.maxA + 1e-6) { L |= u[i].m[0] & u[j].m[0]; R |= u[i].m[1] & u[j].m[1]; fr |= u[i].m[2] & u[j].m[2]; H |= u[i].m[4] & u[j].m[4]; }
+        }
+        return [L === full && R === full && S === full, fr, B === full, H === full];
+      };
+      const [ok, fr, seen, tri] = cover();
+      front += bits(fr);
+      if (!ok) return Math.min(v.length, 2);
+      good++; rear += seen; hands += tri;
+      if (!bare && v.every((c) => cover(c.th)[0])) spare++;
+      return 3 + seen + tri;
+    });
+    // front: share of points and facings with a pair in front of the subject, the best measured kind
+    // rear, hands: share of points covered with the back seen, and with it triangulated
+    // spare: share of points still covered with any one view blocked
+    const n = pts.length;
+    return { state, frac: good / n, front: front / (n * F.length), rear: rear / n, hands: hands / n, spare: spare / n };
+  }
+
+  // Candidate camera positions (5 cm off the walls: every STEP m from the middle of the front and back
+  // walls and from the front corners along the side walls, plus the corners), each with its bearing,
+  // masks and front count seen from the search points. Volume-centred coordinates; the front wall is at -y.
+  // Room and rule are mirror images left to right when the subject faces the front wall and the volume is
+  // centred side to side, so layouts are too, and the points with x >= 0 decide. Facing a corner (or with the
+  // volume moved sideways) every point counts and cameras are placed one at a time.
+  // o.side = how far the volume centre sits right of the room centre.
+  const geoCache = new Map();
+  function geometry(o, gridN) {
+    const key = JSON.stringify([o.roomW, o.roomD, o.volW, o.volD, o.back, o.side, o.face, o.turn, o.one, gridN]);
+    if (geoCache.has(key)) return geoCache.get(key);
+    if (geoCache.size > 300) geoCache.clear();
+    const sym = !o.face && !o.side && !o.one, xc = -(o.side || 0);
+    const F = facings(o), S = grid(o, gridN).filter(([x]) => !sym || x > -1e-9), wt = S.map(([x]) => (sym && x > 1e-9 ? 2 : 1));
+    const hx = o.roomW / 2 - 0.05, y0 = -o.roomD / 2 - o.back + 0.05, y1 = o.roomD / 2 - o.back - 0.05, pos = [];
+    const add = (x, y, wall, along) => {
+      const p = { x: xc + x, y, wall, along, th: new Float64Array(S.length), m: new Int32Array(S.length * 2), st: new Int32Array(S.length), rear: new Int32Array(S.length), front: new Uint8Array(S.length) };
+      S.forEach(([sx, sy], q) => { p.th[q] = bearing(p, sx, sy); const m = masks(p.th[q], F); p.m[q * 2] = m[0]; p.m[q * 2 + 1] = m[1]; p.st[q] = m[3]; p.rear[q] = m[4]; p.front[q] = bits(m[2]); });
+      pos.push(p);
+      return p;
+    };
+    // x from the room centre; along = distance from the left corner (front and back walls) or from the
+    // front corner (side walls)
+    const both = (x, y, wall, along, alongMirror) => { const p = add(x, y, wall, along); if (x > 1e-9) { const m = add(-x, y, wall === "right" ? "left" : wall, alongMirror); if (sym) { p.mirror = m; m.twin = true; } } };
+    for (let x = 0; x < hx - STEP / 2; x += STEP) { both(x, y0, "front", o.roomW / 2 + x, o.roomW / 2 - x); both(x, y1, "back", o.roomW / 2 + x, o.roomW / 2 - x); }
+    both(hx, y0, "front", o.roomW, 0); both(hx, y1, "back", o.roomW, 0);
+    for (let a = STEP; a < o.roomD - STEP / 2; a += STEP) both(hx, y0 - 0.05 + a, "right", a, a);
+    const geo = { F, S, pos, wt, sym, total: wt.reduce((a, b) => a + b, 0) };
+    geoCache.set(key, geo);
+    return geo;
+  }
+
+  // A camera at wall spot p aimed at one of AIMS, with the search points it sees (k, has).
+  function view(p, [i, j], op, o, S, wt) {
+    const tx = i * o.volW / 2, ty = j * o.volD / 2, d = Math.hypot(tx - p.x, ty - p.y);
+    const c = { x: p.x, y: p.y, ax: (tx - p.x) / d, ay: (ty - p.y) / d, wall: p.wall, along: p.along, aim: [i, j], p, k: [], has: new Uint8Array(S.length), front: 0 };
+    for (let q = 0; q < S.length; q++) if (sees(c, op, S[q][0], S[q][1])) { c.k.push(q); c.has[q] = 1; c.front += wt[q] * p.front[q]; }
+    return c;
+  }
+
+  // Fewest cameras for one volume position. A unit is a mirrored pair of cameras or one camera on the
+  // centre line. Add the unit that covers the most per camera until the target is met, then try to drop
+  // units and to swap two units for one smaller one.
+  // seed: cameras already placed (kept, never dropped); tier 2 also asks for the back seen, tier 3 for it
+  // triangulated (see evaluate()).
+  const unitCache = new Map();
+  function place(op, o, gridN, nMax, seed = [], tier = 1) {
+    const { F, S, pos, wt, sym, total } = geometry(o, gridN), nS = S.length, full = (1 << F.length) - 1;
+    // The search may run past nMax, to 24 cameras, because dropping and swapping afterwards often brings it
+    // back under. (Running to 40 fitted 5 more of 160 test cases and took 1.7 times as long.)
+    const lim = 24, cap = lim + 1;
+    const lo = o.minA - 1e-6, hi = o.maxA + 1e-6;
+    const cam = (p, aim) => view(p, aim, op, o, S, wt);
+    const fixed = seed.map((s) => cam(pos.find((p) => Math.abs(p.x - s.x) < 1e-6 && Math.abs(p.y - s.y) < 1e-6), s.aim));
+    // the units for these positions and optics are the same for every tier, so the last few page runs keep them
+    // (the sweep's are never asked for again)
+    const geo = geometry(o, gridN), hit = unitCache.get(geo), fresh = !hit || hit.op !== op, units = fresh ? [] : hit.units;
+    if (fresh && !o.quick) { if (unitCache.size > 30) unitCache.clear(); unitCache.set(geo, { op, units }); }
+    for (const p of fresh ? pos : []) {
+      if (p.twin) continue;
+      const here = AIMS.filter((a) => !sym || p.mirror || !a[0]).map((a) => (sym && p.mirror ? [cam(p, a), cam(p.mirror, [-a[0], a[1]])] : [cam(p, a)]));
+      // An aim that sees nothing another aim from the same spot misses is never the better choice.
+      // Of aims that see the same points, the first (nearest the volume centre) is kept.
+      const within = (u, w) => u.every((c, i) => c.k.every((q) => w[i].has[q])), count = (u) => u.reduce((a, c) => a + c.k.length, 0);
+      here.forEach((u, i) => { if (count(u) && !here.some((w, j) => j !== i && w.length === u.length && within(u, w) && (count(w) > count(u) || j < i))) units.push(u); });
+    }
+    // Front views are the best measured, so they break ties between units that cover the same.
+    // 0.02 per point and facing keeps this below any real difference in coverage. Judgement, not measured.
+    for (const u of units) u.front = 0.02 * u.reduce((a, c) => a + c.front, 0) / u.length;
+    // Quick runs (the sweep) give up at once when too many points have no camera spot that could be straight on
+    // for every facing; full runs carry on so the page can show the best layout they reach.
+    let none = 0;
+    for (let q = 0; q < nS && o.quick; q++) {
+      let m = 0;
+      for (const u of units) for (const c of u) if (c.has[q]) m |= c.p.st[q];
+      if (m !== full && (none += wt[q]) > (1 - o.need) * total + 1e-9) return { cams: [] };
+    }
+
+    // Search state per point: the cameras that see it (bearing; left, right and back masks), the facings covered
+    // for each side, the facings with at least one view of each side, the facings with a straight-on camera, and
+    // the facings with the back seen and triangulated (set to all when the tier does not ask for them).
+    let vn, vth, vm, vr, cov, seen, st, rs, rp;
+    const reset = () => {
+      vn = new Int32Array(nS); vth = new Float64Array(nS * cap); vm = new Int32Array(nS * cap * 2); vr = new Int32Array(nS * cap); cov = new Int32Array(nS * 2); seen = new Int32Array(nS * 2); st = new Int32Array(nS);
+      rs = new Int32Array(nS).fill(tier >= 2 ? 0 : full); rp = new Int32Array(nS).fill(tier >= 3 ? 0 : full);
+      fixed.forEach((c) => gain(c, true));
+    };
+    const inBand = (a, b) => { const d = Math.abs(a - b), t = d > 180 ? 360 - d : d; return t >= lo && t <= hi; };
+    const old = new Int32Array(nS * 7);
+    // Coverage a camera adds: newly covered facings per side, newly straight-on facings and newly seen and
+    // triangulated back facings, plus a quarter for a first view of a side (a pair needs two; without it the
+    // first camera would score nothing). keep: save what is overwritten.
+    const T2 = tier >= 2, T3 = tier >= 3;
+    function gain(c, commit, keep) {
+      const k = c.k, pth = c.p.th, pm = c.p.m, pr = c.p.rear;
+      let g = 0;
+      for (let i = 0; i < k.length; i++) {
+        const q = k[i], l = q * 2, r = l + 1;
+        if (!commit && cov[l] === full && cov[r] === full && st[q] === full && rs[q] === full && rp[q] === full) continue;
+        const th = pth[q], n = vn[q], b = q * cap, mL = pm[l], mR = pm[r], mB = T2 ? pr[q] : 0;
+        let nL = 0, nR = 0, nP = 0;
+        for (let v = b; v < b + n; v++) {
+          if (inBand(th, vth[v])) { nL |= mL & vm[v * 2]; nR |= mR & vm[v * 2 + 1]; if (T3) nP |= mB & vr[v]; }
+        }
+        nL &= ~cov[l]; nR &= ~cov[r]; nP &= ~rp[q];
+        const ms = c.p.st[q];
+        g += wt[q] * (bits(nL) + bits(nR) + bits(ms & ~st[q]) + 0.25 * (bits(mL & ~seen[l] & ~cov[l] & ~nL) + bits(mR & ~seen[r] & ~cov[r] & ~nR)));
+        if (T2) g += wt[q] * (bits(mB & ~rs[q]) + bits(nP));   // the back, out of the cover's path so the sweep stays as fast
+        if (!commit) continue;
+        if (keep) { const o7 = i * 7; old[o7] = cov[l]; old[o7 + 1] = cov[r]; old[o7 + 2] = seen[l]; old[o7 + 3] = seen[r]; old[o7 + 4] = st[q]; old[o7 + 5] = rs[q]; old[o7 + 6] = rp[q]; }
+        cov[l] |= nL; cov[r] |= nR; seen[l] |= mL; seen[r] |= mR; st[q] |= ms; rs[q] |= mB; rp[q] |= nP;
+        vth[b + n] = th; vm[(b + n) * 2] = mL; vm[(b + n) * 2 + 1] = mR; vr[b + n] = pr[q]; vn[q] = n + 1;
+      }
+      return g;
+    }
+    // Coverage per camera of a unit. For a pair the second camera is scored with the first in place.
+    function unitGain([a, b]) {
+      if (!b) return gain(a, false);
+      const g = gain(a, true, true) + gain(b, false);
+      a.k.forEach((q, i) => { const o7 = i * 7; vn[q]--; cov[q * 2] = old[o7]; cov[q * 2 + 1] = old[o7 + 1]; seen[q * 2] = old[o7 + 2]; seen[q * 2 + 1] = old[o7 + 3]; st[q] = old[o7 + 4]; rs[q] = old[o7 + 5]; rp[q] = old[o7 + 6]; });
+      return g / 2;
+    }
+    const build = (us) => { reset(); us.forEach((u) => u.forEach((c) => gain(c, true))); };
+    const open = () => { const out = []; for (let q = 0; q < nS; q++) if (cov[q * 2] !== full || cov[q * 2 + 1] !== full || st[q] !== full || rs[q] !== full || rp[q] !== full) out.push(q); return out; };
+    const frac = () => 1 - open().reduce((a, q) => a + wt[q], 0) / total;
+    const met = () => frac() >= o.need - 1e-9;
+    // Would adding this unit meet the target? Only the open points can change, so only they are checked.
+    function closes(u, gap) {
+      const spare = (1 - o.need) * total + 1e-9;
+      let still = 0;
+      for (const q of gap) {
+        const l = q * 2, r = l + 1, b = q * cap;
+        let L = cov[l], R = cov[r], T = st[q], B = rs[q], P = rp[q];
+        u.forEach((c, i) => {
+          if (!c.has[q]) return;
+          T |= c.p.st[q]; B |= c.p.rear[q];
+          const th = c.p.th[q], mL = c.p.m[l], mR = c.p.m[r], mB = c.p.rear[q];
+          for (let v = b; v < b + vn[q]; v++) if (inBand(th, vth[v])) { L |= mL & vm[v * 2]; R |= mR & vm[v * 2 + 1]; P |= mB & vr[v]; }
+          if (i && u[0].has[q] && inBand(th, u[0].p.th[q])) { L |= mL & u[0].p.m[l]; R |= mR & u[0].p.m[r]; P |= mB & u[0].p.rear[q]; }
+        });
+        if ((L !== full || R !== full || T !== full || B !== full || P !== full) && (still += wt[q]) > spare) return false;
+      }
+      return true;
+    }
+    const size = (us) => fixed.length + us.reduce((a, u) => a + u.length, 0);
+    const clear = (u, us) => u.every((c) => fixed.every((d) => apart(c, d)) && us.every((w) => w.every((d) => apart(c, d))));
+
+    let sol = [];
+    const left = new Float64Array(nS);
+    reset();
+    // Once the seed covers every point, only cameras that see some of it from behind can add anything.
+    let pool = units;
+    if (tier >= 2 && st.every((m, q) => m === full && cov[q * 2] === full && cov[q * 2 + 1] === full)) pool = units.filter((u) => u.some((c) => c.k.some((q) => c.p.rear[q])));
+    while (!met() && size(sol) < lim) {
+      // the most any camera could still add at each point: units are tried best bound first, and the
+      // search stops at the first that cannot beat the best found
+      for (let q = 0; q < nS; q++) left[q] = wt[q] * (bits(full & ~cov[q * 2]) + bits(full & ~cov[q * 2 + 1]) + bits(full & ~st[q]) + bits(full & ~rs[q]) + bits(full & ~rp[q]));
+      const order = pool.filter((u) => size(sol) + u.length <= lim && clear(u, sol)).map((u) => { let b = 0; for (const c of u) for (const q of c.k) b += left[q]; return [b / u.length + u.front, u]; }).sort((a, b) => b[0] - a[0]);
+      let best = null, bg = 0;
+      for (const [bound, u] of order) {
+        if (bound <= bg) break;
+        const g = unitGain(u);
+        if (g > 1e-9 && g + u.front > bg + 1e-9) { bg = g + u.front; best = u; }
+      }
+      if (!best) break;
+      best.forEach((c) => gain(c, true));
+      sol.push(best);
+    }
+    const covered = met();
+    if (covered) {
+      const without = (...drop) => sol.filter((_, i) => !drop.includes(i));
+      for (let again = true; again;) {
+        again = false;
+        for (let i = sol.length - 1; i >= 0; i--) {
+          build(without(i));
+          if (met()) { sol = without(i); again = true; }
+        }
+        swap: for (let i = 0; i < sol.length && !again; i++) for (let j = i + 1; j < sol.length; j++) {
+          const room = sol[i].length + sol[j].length - 1;
+          build(without(i, j));
+          const gap = open(), rest = without(i, j), u = pool.find((u) => u.length <= room && clear(u, rest) && closes(u, gap));
+          if (u) { sol = rest.concat([u]); again = true; break swap; }
+        }
+      }
+    }
+    // Still over the limit: hand back the first nMax cameras.
+    while (size(sol) > nMax && sol.length) sol.pop();
+    return { cams: seed.concat(sol.flat().map(({ x, y, ax, ay, wall, along, aim }) => ({ x, y, ax, ay, wall, along, aim }))) };
+  }
+
+  // A fit wins, then more coverage, then fewer cameras, then clearly more front pairs (5 points of share;
+  // less than that is noise and would move the volume for nothing).
+  const better = (a, b) => (a.ok !== b.ok ? a.ok : Math.abs(a.frac - b.frac) > 1e-9 ? a.frac > b.frac : a.n !== b.n ? a.n < b.n : a.front > b.front + 0.05);
+
+  // The subject faces the front wall (face 0) or, unless quick or turning freely, is turned 45 degrees to face
+  // the front-right corner (face 45; the front-left is its mirror image); o.face fixes it. Facing the wall, the
+  // volume is centred side to side and tried centred, halfway back and as far back as it goes (0.2 m from the
+  // back wall); facing the corner it also moves the same share of the way towards the left wall. o.gap fixes
+  // the space between front wall and volume instead (and keeps it centred side to side). back = how far the
+  // volume centre sits behind the room centre, side = how far right of it. better() picks.
+  // A layout that covers a full turn covers any smaller arc, and the search sometimes finds a ring only
+  // when asked for one, so that is tried too unless quick (the sweep, to save time) or the subject does not
+  // turn (it never won at 0 degrees in the 160-case set).
+  // alts: the best layout at every volume position and facing tried, for withN() to build the back onto.
+  function where(o, quick) {
+    const T = o.turn || 0, maxY = Math.max(0, (o.roomD - o.volD) / 2 - 0.2), maxX = Math.max(0, (o.roomW - o.volW) / 2 - 0.2), out = [];
+    for (const face of o.face != null ? [o.face] : quick || T >= 360 ? [0] : [0, 45]) for (const k of o.gap != null ? [null] : (face ? maxY || maxX : maxY) ? [0, 0.5, 1] : [0]) {
+      out.push({ back: k == null ? Math.max(-maxY, Math.min(maxY, o.gap + (o.volD - o.roomD) / 2)) : k * maxY, side: face && k ? -k * maxX : 0, face });
+    }
+    return out;
+  }
+  function solve(sensor, f, o, gridN = 25, nMax = CAP, quick = false) {
+    const op = optics(sensor, o.orient, f, o), pts = grid(o, gridN), T = o.turn || 0;
+    let best = null;
+    for (const { back, side, face } of where(o, quick)) {
+      const oo = Object.assign({}, o, { back, side, face });
+      let here = null;
+      for (const turn of quick || !T || T >= 360 || face ? [T] : [T, 360]) {
+        const { cams } = place(op, Object.assign({}, oo, { turn, quick }), gridN, nMax), n = cams.length, ev = evaluate(cams, op, oo, pts, true);
+        const r = { n, ok: ev.frac >= o.need - 1e-9 && n <= nMax, cams, frac: ev.frac, front: ev.front, state: ev.state, op, pts, back, side, face };
+        if (!here || better(r, here)) here = r;
+      }
+      if (!best || better(here, best)) best = here;
+      if (quick && best.ok && best.n <= 2) return best;   // cannot be beaten
+    }
+    return best;
+  }
+
+  // Search data for one volume position: every camera that could stand there (wall spot and aim, seeing some of
+  // the volume), with its bearing from the way the subject faces, seen from the volume centre (dir, signed; az,
+  // 0 to 180) and whether that makes it a rear view (behind). k2 = the points it sees on every QUICK-th row and column, for a quick
+  // first look. K = the points a step needs (o.need of them).
+  function field(op, o, gridN) {
+    const { F, S, pos, wt } = geometry(o, gridN), at = new Map(), key = (c) => [c.x.toFixed(3), c.y.toFixed(3), c.aim].join();
+    // as in place(): an aim that sees nothing another aim from the same spot misses is never the better choice
+    const every = pos.map((p) => AIMS.map((a) => view(p, a, op, o, S, wt)));
+    const all = every.flatMap((here) => here.filter((c, i) => c.k.length && !here.some((w, j) => j !== i && c.k.every((q) => w.has[q]) && (w.k.length > c.k.length || j < i))));
+    if (!o.quick) unitCache.set(geometry(o, gridN), { op, units: all.map((c) => [c]) });   // place() at this position starts from the same cameras
+    for (const c of every.flat()) { c.dir = wrap(Math.atan2(c.x, -c.y) * 180 / Math.PI - (o.face || 0)); c.az = Math.abs(c.dir); c.behind = c.az >= REAR - 1e-6; c.k2 = c.k.filter((q) => !((q / gridN | 0) % QUICK) && !(q % gridN % QUICK)); c.near = []; for (let i = 0; i < CELLS; i++) if (Math.abs(wrap(c.dir - mid(i))) <= NEARBY + 1e-6) c.near.push(i); at.set(key(c), c); }
+    // rho: the worth of the views from each CELL degrees round the middle of the turning arc, averaged over the
+    // facings in it (a subject who turns all the way round is seen equally from everywhere); sums to 1
+    const rho = new Float64Array(CELLS), rel = F.map((f) => f - (o.face || 0));
+    for (let i = 0; i < CELLS; i++) for (const f of rel) { const k = Math.min(11, Math.abs(wrap(mid(i) - f)) / 15 | 0); rho[i] += SHARE[k] * ERR[0] / ERR[k]; }
+    const sum = rho.reduce((a, b) => a + b, 0); rho.forEach((v, i) => { rho[i] = v / sum; });
+    return { all, rho, nS: S.length, K: Math.ceil(o.need * S.length - 1e-9), full: (1 << F.length) - 1, lo: o.minA - 1e-6, hi: o.maxA + 1e-6, find: (c) => at.get(key(c)) };
+  }
+
+  // The share of training views (by worth, see SHARE) that a camera of this layout stands for, seen from the volume
+  // centre: the dataset's own measure of a camera position. had: the cells already taken, to add a camera to.
+  const mid = (i) => -180 + CELL * (i + 0.5);
+  function trained(cams, fd, had) {
+    const on = had || new Uint8Array(CELLS);
+    let v = 0;
+    for (const c of cams) for (const i of c.near) if (!on[i]) { on[i] = 1; v += fd.rho[i]; }
+    return v;
+  }
+
+  // How far a point gets, as evaluate(): 0 not covered, 1 covered, 2 and the back seen, 3 and hands behind the
+  // back tracked. L, R: facings with each side read by a pair in the band; S: with a straight-on camera; B, H:
+  // with the back seen by one camera, and by a pair in the band.
+  const level = (L, R, S, B, H, full) => (L === full && R === full && S === full ? (B === full ? (H === full ? 3 : 2) : 1) : 0);
+  // The five masks (m) and the level (lv) of every search point for these cameras, and which of them see it
+  // (vi, vn); n = points covered, with the back seen, with hands tracked. step: look at every so many points only.
+  // trail: also at[i] = n for the first i + 1 cameras.
+  function tally(cams, fd, step = 1, trail) {
+    const { nS, full, lo, hi } = fd, N = cams.length, m = new Int32Array(nS * 5), lv = new Uint8Array(nS), n = [0, 0, 0], vi = new Uint8Array(nS * N), vn = new Uint8Array(nS), at = trail && cams.map(() => [0, 0, 0]);
+    for (let q = 0; q < nS; q += step) {
+      const b = q * 5;
+      for (let i = 0; i < cams.length; i++) {
+        if (cams[i].has[q]) {
+          const c = cams[i].p;
+          vi[q * N + vn[q]++] = i;
+          m[b + 2] |= c.st[q]; m[b + 3] |= c.rear[q];
+          for (let j = 0; j < i; j++) {
+            if (!cams[j].has[q]) continue;
+            const d = cams[j].p, a = Math.abs(c.th[q] - d.th[q]), t = a > 180 ? 360 - a : a;
+            if (t >= lo && t <= hi) { m[b] |= c.m[q * 2] & d.m[q * 2]; m[b + 1] |= c.m[q * 2 + 1] & d.m[q * 2 + 1]; m[b + 4] |= c.rear[q] & d.rear[q]; }
+          }
+        }
+        if (trail) for (let k = level(m[b], m[b + 1], m[b + 2], m[b + 3], m[b + 4], full); k--;) at[i][k]++;
+      }
+      lv[q] = level(m[b], m[b + 1], m[b + 2], m[b + 3], m[b + 4], full);
+      for (let k = 0; k < lv[q]; k++) n[k]++;
+    }
+    return { m, lv, n, vi, vn, at };
+  }
+  // One number for a layout, in the owner's order: points covered count before points with the back seen, and
+  // those before points with hands tracked; a step that has all the points it needs stops counting.
+  const worth = (n, fd) => ((Math.min(n[0], fd.K) * (fd.nS + 1)) + Math.min(n[1], fd.K)) * (fd.nS + 1) + Math.min(n[2], fd.K);
+
+  // The camera that is worth most added to rest, among those ok() allows and GAP clear of rest: keep unless
+  // another is worth more (null if there is none at all). Cameras that are worth the same are split by how many
+  // of the training views they stand for that no camera of rest does (trained()), then by how many of a point's
+  // masks they add to, so the search keeps moving when no point changes level yet.
+  // Every camera is scored on its quick points first and only the best LOOK of them on all the points.
+  // back: points with the back seen count first (for the third camera, which is there to see it).
+  function best(rest, fd, ok, keep, back) {
+    const { full, lo, hi, nS } = fd, { m, lv, n, vi, vn } = tally(rest, fd), N = rest.length, rp = rest.map((r) => r.p), had = new Uint8Array(CELLS);
+    trained(rest, fd, had);
+    const adds = (c) => { let v = 0; for (const i of c.near) if (!had[i]) v += fd.rho[i]; return v; };
+    const score = (c, k) => {
+      const p = c.p, th = p.th, pm = p.m, pr = p.rear;
+      let d0 = 0, d1 = 0, d2 = 0, grown = 0;
+      for (let e = 0; e < k.length; e++) {
+        const q = k[e], was = lv[q];
+        if (was === 3) continue;
+        const b = q * 5, mL = pm[q * 2], mR = pm[q * 2 + 1], mB = pr[q], S = m[b + 2] | p.st[q], B = m[b + 3] | mB;
+        let L = m[b], R = m[b + 1], H = m[b + 4];
+        for (let v = q * N, end = v + vn[q]; v < end; v++) {
+          const r = rp[vi[v]], a = Math.abs(th[q] - r.th[q]), t = a > 180 ? 360 - a : a;
+          if (t >= lo && t <= hi) { L |= mL & r.m[q * 2]; R |= mR & r.m[q * 2 + 1]; H |= mB & r.rear[q]; }
+        }
+        const now = level(L, R, S, B, H, full);
+        if (now > was) { if (!was) d0++; if (was < 2 && now > 1) d1++; if (now === 3) d2++; }
+        grown += (L !== m[b]) + (R !== m[b + 1]) + (S !== m[b + 2]) + (B !== m[b + 3]) + (H !== m[b + 4]);
+      }
+      return worth(back ? [n[1] + d1, n[0] + d0, n[2] + d2] : [n[0] + d0, n[1] + d1, n[2] + d2], fd) + 0.9 * adds(c) + 0.09 * grown / (5 * nS + 1);
+    };
+    const quick = fd.all.filter((c) => c !== keep && (!ok || ok(c)) && rest.every((r) => apart(r, c))).map((c) => [score(c, c.k2), c]).sort((a, b) => b[0] - a[0]).slice(0, LOOK);
+    let top = keep || null, ts = keep ? score(keep, keep.k) : -1;
+    for (const [, c] of quick) { const v = score(c, c.k); if (v > ts + 1e-9) { ts = v; top = c; } }
+    return top;
+  }
+
+  // The front pair a layout falls back on when no camera fits face-on: two cameras in front of the subject (within FRONT of the way they
+  // face, one of them within STRAIGHT) whose angle apart, seen from the volume centre, is inside the pair-angle
+  // band. Such pairs triangulated best: 27-28 mm, against 37-41 mm with one camera side-on (see HANDOFF.md).
+  const paired = (a, b, lo, hi) => { const d = Math.abs(wrap(a.dir - b.dir)); return a !== b && a.az <= FRONT && b.az <= FRONT && Math.min(a.az, b.az) <= STRAIGHT && d >= lo && d <= hi; };
+  // The front pair that covers the most (judged on the quick points).
+  function seeds(fd) {
+    const { all, full, lo, hi } = fd;
+    let pair = [], bn = 0;
+    for (const a of all) if (a.az <= STRAIGHT) for (const b of all) if (paired(a, b, lo, hi) && apart(a, b)) {
+      let n = 0;
+      for (const q of a.k2) {
+        if (!b.has[q]) continue;
+        const d = Math.abs(a.p.th[q] - b.p.th[q]), t = d > 180 ? 360 - d : d;
+        if (t >= lo && t <= hi && (a.p.m[q * 2] & b.p.m[q * 2]) === full && (a.p.m[q * 2 + 1] & b.p.m[q * 2 + 1]) === full && (a.p.st[q] | b.p.st[q]) === full) n++;
+      }
+      n += 1e-4 * (a.k2.length + b.k2.length);   // of pairs that cover the same, the one that sees more
+      if (n > bn + 1e-9) { bn = n; pair = [a, b]; }
+    }
+    return pair;
+  }
+
+  // What stays covered with one view blocked as cams are added one by one (spare[n] = that share with the first
+  // n), then, if extend, more cameras up to CAP, each where it most raises that share: every camera of the
+  // field that is GAP clear of the ones already there is tried.
+  function spares(cams, fd, extend) {
+    cams = cams.slice();
+    const nP = fd.nS, full = fd.full, all = 3 * bits(full), lo = fd.lo, hi = fd.hi;
+    const inBand = (a, b) => { const d = Math.abs(a - b), t = d > 180 ? 360 - d : d; return t >= lo && t <= hi; };
+    // Per point and view: bearing; left, right and straight-on masks (m); the same three still covered when
+    // that view is blocked (w); which views are lost with it, itself included (blk) and which pair with it (band).
+    // weak = the fewest facings (left + right + straight on) a point keeps with one view blocked.
+    const vn = new Int32Array(nP), vth = new Float64Array(nP * CAP), vm = new Int32Array(nP * CAP * 3), vw = new Int32Array(nP * CAP * 3);
+    const blk = new Int32Array(nP * CAP), band = new Int32Array(nP * CAP), weak = new Int32Array(nP);
+    // the points a camera sees, each with its bearing and left, right and straight-on masks
+    const pack = (c) => { const k = []; for (const q of c.k) k.push(q, c.p.th[q], c.p.m[q * 2], c.p.m[q * 2 + 1], c.p.st[q]); return k; };
+    // What a camera adds to weak over the points it sees (k), plus a little for points with few views so that
+    // cameras past full cover still go somewhere useful (0.001 per point: below any real gain; judgement).
+    function gain(k, commit) {
+      let g = 0;
+      for (let e = 0; e < k.length; e += 5) {
+        const q = k[e], th = k[e + 1], mL = k[e + 2], mR = k[e + 3], mS = k[e + 4], n = vn[q], b = q * CAP;
+        g += 0.001 / (1 + n);
+        const done = n && weak[q] === all;   // a spot that survives any blocked view still does with one more camera
+        if (done && !commit) continue;
+        let lost = 0, pair = 0;   // old views lost when the new one is blocked; old views that pair with the new one
+        for (let i = 0; i < n; i++) { if (blocked(th, vth[b + i])) lost |= 1 << i; if (inBand(th, vth[b + i])) pair |= 1 << i; }
+        // an old view blocked: the new one adds its pairs, unless it is lost too
+        let least = all;
+        for (let i = 0; i < n && !done; i++) {
+          const w = (b + i) * 3;
+          let wL = vw[w], wR = vw[w + 1], wS = vw[w + 2];
+          if (!blocked(vth[b + i], th)) { wS |= mS; for (let j = 0, p = pair & ~blk[b + i]; j < n; j++) if (p >> j & 1) { wL |= mL & vm[(b + j) * 3]; wR |= mR & vm[(b + j) * 3 + 1]; } }
+          least = Math.min(least, bits(wL) + bits(wR) + bits(wS));
+          if (commit) { vw[w] = wL; vw[w + 1] = wR; vw[w + 2] = wS; } else if (least === weak[q]) break;   // nothing gained here: a camera never lowers it
+        }
+        if (!commit && n && least === weak[q]) continue;
+        // the new view blocked: what the old views outside its sector cover
+        let L = done ? full : 0, R = L, S = L;
+        for (let i = 0; i < n && !done; i++) {
+          if (lost >> i & 1) continue;
+          S |= vm[(b + i) * 3 + 2];
+          for (let j = i + 1, p = band[b + i] & ~lost; j < n; j++) if (p >> j & 1) { L |= vm[(b + i) * 3] & vm[(b + j) * 3]; R |= vm[(b + i) * 3 + 1] & vm[(b + j) * 3 + 1]; }
+        }
+        least = Math.min(least, bits(L) + bits(R) + bits(S));
+        g += done ? 0 : least - weak[q];
+        if (!commit) continue;
+        for (let i = 0; i < n; i++) { if (blocked(vth[b + i], th)) blk[b + i] |= 1 << n; if (pair >> i & 1) band[b + i] |= 1 << n; }
+        const w = (b + n) * 3;
+        vth[b + n] = th; vm[w] = mL; vm[w + 1] = mR; vm[w + 2] = mS; vw[w] = L; vw[w + 1] = R; vw[w + 2] = S; blk[b + n] = lost | 1 << n; band[b + n] = pair;
+        vn[q] = n + 1; weak[q] = done ? all : least;
+      }
+      return g;
+    }
+    const spare = [];
+    cams.forEach((c, i) => { gain(pack(c), true); spare[i + 1] = weak.reduce((a, w) => a + (w === all), 0) / nP; });
+    if (!extend) return { cams, spare };
+    let cand = fd.all.map((c) => [c, pack(c)]);
+    while (cams.length < CAP) {
+      cand = cand.filter((ck) => cams.every((u) => apart(u, ck[0])));
+      let best = null, bg = -1;
+      for (const ck of cand) { const g = gain(ck[1], false); if (g > bg + 1e-9) { bg = g; best = ck; } }
+      if (!best) break;   // the walls are full
+      gain(best[1], true);
+      cams.push(best[0]);
+      spare[cams.length] = weak.reduce((a, w) => a + (w === all), 0) / nP;
+    }
+    return { cams, spare };
+  }
+
+  const bare = ({ x, y, ax, ay, wall, along, aim }) => ({ x, y, ax, ay, wall, along, aim });
+  // More cameras for one volume position, on top of cams, searched the other way: the fewest place() finds that
+  // cover the volume (mirrored pairs where the room and cams allow), then the fewest more until a camera sees the
+  // back everywhere, then until two do (hands behind the back). Better than the camera-by-camera search at many
+  // cameras and wide turning arcs. steps: stop after this many of the three.
+  function line(op, x, gridN, cams, steps = 3) {
+    // mirrored pairs need a volume on the room's centre line, facing the front wall, and cams that mirror each
+    // other; elsewhere the field's own geometry and cameras serve (field() hands them to place())
+    const even = !x.o.face && !x.o.side && cams.every((c) => cams.some((d) => Math.abs(d.x + c.x) < 1e-6 && Math.abs(d.y - c.y) < 1e-6 && d.aim[0] === -c.aim[0] && d.aim[1] === c.aim[1]));
+    const o = even ? Object.assign({}, x.o, { one: false }) : x.o;
+    cams = cams.map(bare);
+    for (let tier = 1; tier <= steps; tier++) {
+      if (cams.length >= CAP) break;
+      const r = place(op, o, gridN, CAP, cams, tier);
+      cams = r.cams;
+      if (tally(cams.map(x.fd.find), x.fd).n[tier - 1] < x.fd.K) break;   // a step not finished: nothing to build the next onto
+    }
+    return cams.map(x.fd.find);
+  }
+
+  // The best layout found for every count from 2 to CAP, each planned for that count alone: the volume position
+  // and every camera may differ from one count to the next. Every layout starts from a camera face-on to the
+  // subject: the view pose models are trained on most (39% of training views are within 15 degrees of it) and
+  // read best. How it gets one is the plan's mode. "wall" unless "corner" covers the volume with fewer cameras;
+  // "pair" only when neither covers it with any count up to CAP and the pair does; if nothing covers, the first of
+  // the three that has a layout at all:
+  //   "wall"    the subject faces the front wall, with a camera dead ahead on it;
+  //   "corner"  the subject is turned 45 degrees to face the front-right corner, with a camera dead ahead there
+  //             (not tried when they turn all the way round, or when o.face fixes the facing);
+  //   "pair"    no camera face-on: two cameras straddle the front (seeds()), facing the wall or the corner.
+  // A face-on camera stands within AHEAD degrees of dead ahead and sees a full body, with enough pixels, at the
+  // volume centre. With a turning arc, face-on means face-on to the middle of the arc; evaluate() still asks for a
+  // camera within STRAIGHT degrees of every facing.
+  // Cameras are then added one at a time, each where the layout is worth most (best(): covered, then the back
+  // seen, then hands behind it tracked, then the training views near a camera); the third is the rear view that
+  // sees the most backs. Every volume position grows its own layout up to WIDE cameras and has its line(); a count
+  // takes the best of those layouts and the first so many cameras of each line (once they include a rear view);
+  // and of the layout for one camera fewer with the best camera added, which past WIDE replaces the grown layouts.
+  // So a count never does worse in that order than the one before. Once everything is tracked a layout only gains spares.
+  // shortcut: a search that adds one camera at a time, not an exact optimum.
+  function plan(sensor, f, o, gridN = 25) {
+    const op = optics(sensor, o.orient, f, o), pts = grid(o, gridN), nS = pts.length;
+    const spots = where(o).map((w) => { const oo = Object.assign({}, o, w, { one: true }); return { o: oo, fd: field(op, oo, gridN) }; });
+    const row = (x, cams, more) => Object.assign({ x, cams, n: tally(cams, x.fd).n, v: trained(cams, x.fd) }, more);
+    const s = (r) => worth(r.n, r.x.fd) + r.v / 2, covered = (r) => r.n[0] >= r.x.fd.K, done = (r) => r.n[2] >= r.x.fd.K;
+    // a layout that covers beats one that does not; then, from three cameras, one with a rear view beats one without; then s()
+    const rear = (r) => r.cams.length < 3 || r.cams.some((c) => c.behind);
+    const top = (c) => c.reduce((a, b) => (covered(a) !== covered(b) ? covered(b) : rear(a) !== rear(b) ? rear(b) : s(b) > s(a) + 1e-9) ? b : a);
+    // Facing the front wall from the room's centre line, or a corner along the diagonal of a square room, left and
+    // right of the subject are mirror images (the room, the body and the training views), so a camera off that line
+    // is followed by its mirror image: each side of the body gets the same views.
+    const twin = (r) => {
+      const { face, side, back } = r.x.o, diag = face && o.roomW === o.roomD && o.volW === o.volD && Math.abs(side + back) < 1e-9;
+      if (face ? !diag : side) return null;
+      for (const c of r.cams) {
+        const at = face ? Math.abs(c.x + c.y) > 1e-6 && { x: -c.y, y: -c.x, aim: [-c.aim[1], -c.aim[0]] } : Math.abs(c.x) > 1e-6 && { x: -c.x, y: c.y, aim: [-c.aim[0], c.aim[1]] };
+        const m = at && r.x.fd.find(at);
+        if (m && !r.cams.includes(m) && r.cams.every((e) => apart(e, m))) return m;
+      }
+      return null;
+    };
+    // one more camera: third, a rear view if there is one, wherever it sees the back in the most of what is covered;
+    // else the mirror image of a camera that lacks one; else wherever the layout is worth most
+    const grow = (r) => {
+      const fd = r.x.fd, rear = r.cams.length === 2 && fd.all.some((d) => d.behind && r.cams.every((e) => apart(e, d)));
+      const b = (!rear && twin(r)) || best(r.cams, fd, rear ? (d) => d.behind : null, null, rear);
+      return b ? row(r.x, r.cams.concat(b)) : r;
+    };
+    const build = (mode, quick) => {
+      // where each volume position starts: the face-on camera, or the front pair
+      let live = spots.filter((x) => mode === "pair" || mode === (x.o.face ? "corner" : "wall")).map((x) => {
+        const sees0 = (c) => sees(c, op, 0, 0), az = Math.min(AHEAD, ...x.fd.all.filter(sees0).map((c) => c.az)) + 1e-6;   // the most nearly dead ahead
+        const head = mode === "pair" ? seeds(x.fd) : [best([], x.fd, (c) => c.az <= az && sees0(c))];
+        return head[0] ? row(x, head) : mode === "pair" && row(x, []);
+      }).filter(Boolean);
+      if (!live.length) return null;
+      // fit only: the lines answer it (they are among the layouts below, so a fit here is a fit there), far sooner
+      // than growing every position to CAP cameras
+      if (quick) return { mode, rows: [live[0]], fit: live.some((r) => { const cams = line(op, r.x, gridN, r.cams, 2); return tally(cams, r.x.fd, 1, true).at.some((n, i) => n[0] >= r.x.fd.K && (i < 2 || cams.slice(0, i + 1).some((c) => c.behind))); }) };
+      const lines = live.map((r) => ({ x: r.x, cams: line(op, r.x, gridN, r.cams) }));
+      const from = (m) => lines.filter((l) => l.cams.length >= m && l.cams.slice(0, m).some((c) => c.behind)).map((l) => row(l.x, l.cams.slice(0, m)));
+      const rows = [], keeps = (p) => (r) => !p || r.n[0] >= p.n[0];
+      for (let n = 2, prev = null; n <= CAP; n++) {
+        if (prev && done(prev)) {
+          // everything is tracked: only spares are left to add
+          const e = prev.ext || spares(prev.cams, prev.x.fd, true), k = Math.min(n, e.cams.length);
+          prev = row(prev.x, e.cams.slice(0, k), { spare: e.spare[k], ext: e, base: prev.base || prev.cams.length });   // base: the cameras before the spares
+        } else if (n <= WIDE) {
+          live = live.map((r) => (r.cams.length < n ? grow(r) : r));
+          // the layout before carries on too (it may be a line that ends here), and nothing that covers less than it is taken
+          prev = top(live.concat(from(n), prev ? grow(prev) : []).filter(keeps(prev)));
+        } else {
+          prev = top([grow(prev)].concat(from(n).filter(keeps(prev))));
+        }
+        rows.push(prev);
+      }
+      return { mode, rows, fit: rows.some(covered) };
+    };
+    // fewest: the count a mode first covers with. The corner is taken over the wall only when it covers with fewer
+    // cameras, the pair only when neither face-on camera covers at all.
+    // To save time a front view that cannot be the plan's is only searched as far as its lines (lazy): the corner when
+    // the wall does not cover, the pair when there is a face-on layout to show.
+    // shortcut: a corner or pair that only the camera-by-camera search would cover is missed, upgrade if a plan without a face-on camera looks wrong.
+    const fewest = (b) => { const i = b.rows.findIndex(covered); return i < 0 ? Infinity : b.rows[i].cams.length; };
+    const lazy = (mode) => { const q = build(mode, true); return q && q.fit ? build(mode) : q && Object.assign(q, { quick: true }); };
+    const wall = build("wall"), corner = wall && wall.fit ? build("corner") : wall ? lazy("corner") : build("corner");
+    const faced = [wall, corner].filter(Boolean), fitted = faced.filter((b) => b.fit).sort((a, b) => fewest(a) - fewest(b))[0], show = faced.find((b) => !b.quick);
+    const pair = fitted ? null : show ? lazy("pair") : build("pair");
+    const P = fitted || (pair && (pair.fit || !show) ? pair : show);
+    const blocked = (r) => (r.spare != null ? r.spare : spares(r.cams, r.x.fd, false).spare[r.cams.length] || 0);
+    // kept per input by the page, so only what withN() needs is kept
+    const tried = {};
+    for (const b of faced) tried[b.mode] = b.fit ? fewest(b) : null;
+    // tried: the fewest cameras each face-on mode covers with (null: no count does)
+    return { op, pts, need: o.need - 1e-9, mode: P.mode, tried,
+      rows: P.rows.map((r) => ({ o: r.x.o, cams: r.cams.map((c, i) => Object.assign(bare(c), { dir: c.dir, az: c.az, behind: c.behind, extra: i >= r.base })), frac: r.n[0] / nS, rear: r.n[1] / nS, hands: r.n[2] / nS, spare: blocked(r) })) };
+  }
+
+  // The layout for exactly n cameras (2 to CAP) from a plan, with the cameras in the owner's order: 1 the camera
+  // most nearly face-on, 2 the next most nearly in front, 3 the rear view most nearly behind the subject, then the
+  // rest by angle, then the spares in the order they were added (c.extra). c.az is the angle round from the way the
+  // subject faces. mode: how the plan gets its front view (see plan()); head: camera 1 is face-on (within AHEAD).
+  // byN = the shares at every count; min, min2, min3 = the fewest that cover / also see the back / also track
+  // hands behind it; full = the fewest that stay covered with any one view blocked (null when no count does it).
+  function withN(P, n) {
+    const r = P.rows[Math.max(0, Math.min(n, CAP) - 2)], o = r.o, cams = r.cams;
+    const byAz = cams.filter((c) => !c.extra).sort((a, b) => a.az - b.az), three = byAz.slice(2).filter((c) => c.behind).pop();
+    const lead = byAz.slice(0, 2).concat(three || []), order = lead.concat(byAz.filter((c) => !lead.includes(c)), cams.filter((c) => c.extra));
+    const byN = P.rows.map((y) => ({ n: y.cams.length, frac: y.frac, rear: y.rear, hands: y.hands, spare: y.spare }));
+    const first = (ok) => { const y = byN.find(ok); return y ? y.n : null; };
+    return { op: P.op, pts: P.pts, back: o.back, side: o.side, face: o.face, cams: order, n: cams.length, mode: P.mode, head: !!byAz.length && byAz[0].az <= AHEAD + 1e-6, ok: r.frac >= P.need, frac: r.frac, rear: r.rear, hands: r.hands, spare: r.spare, state: evaluate(cams, P.op, o, P.pts, true).state,
+      need: P.need, byN, min: first((y) => y.frac >= P.need), min2: first((y) => y.rear >= P.need), min3: first((y) => y.hands >= P.need), full: first((y) => y.spare > 1 - 1e-9) };
+  }
+
+  // Which of two layouts from withN() does more: with its cameras, one with a camera face-on to the subject (head) beats one
+  // without (the owner's first priority, the view pose models know best); then the higher score (below); then the share covered, with
+  // the back seen, with hands behind the back tracked (each counted up to the target, so two that both reach it tie there),
+  // and what stays covered with one view blocked; then the fewer cameras that cover it (none counts as more than CAP);
+  // then the score and shares with the most cameras (so where no layout of this many does anything, the one that gets
+  // further with more wins). Shares count in whole percent, as the page shows them.
+  // Score = covered + back seen / 2 + hands tracked / 4. Back seen and hands tracked are parts of covered (evaluate()),
+  // so a spot counts 1 covered, 1.5 with the back seen and 1.75 with hands tracked: 1 point of covered is worth 2 of back
+  // seen. Judgement: one rear view takes a wrist behind the back from about 105 mm off to 24-64 mm, a second to 11-40 mm
+  // (see HANDOFF.md). The blocked-view share stays out of it: a tie-break (more people are a bonus, not the goal).
+  // Positive when x does more, 0 on a tie.
+  function ahead(x, y) {
+    const pc = (v) => Math.floor(v * 100 + 1e-6), shares = (r) => [Math.min(pc(r.frac), pc(x.need)), Math.min(pc(r.rear), pc(x.need)), Math.min(pc(r.hands), pc(x.need)), pc(r.spare)];
+    const scored = (r) => { const s = shares(r); return [s[0] + s[1] / 2 + s[2] / 4, ...s]; };
+    const k = (h) => [+h.head, ...scored(h), -(h.min || CAP + 1), ...scored(h.byN[h.byN.length - 1])];
+    const a = k(x), b = k(y), i = a.findIndex((v, j) => v !== b[j]);
+    return i < 0 ? 0 : a[i] - b[i];
+  }
+  // Of plans for one sensor ({ f, orient, P }), the one that does most with n cameras: ahead(), then the longer lens
+  // (more pixels on the person), then landscape. Returns that entry with its layout for n as sol.
+  function choose(plans, n) {
+    const key = (p) => [p.f, +(p.orient === "landscape")];
+    return plans.map((p) => Object.assign({}, p, { sol: withN(p.P, n) })).reduce((a, b) => {
+      const d = ahead(b.sol, a.sol), [bf, bl] = key(b), [af, al] = key(a);
+      return d > 0 || (!d && (bf > af + 1e-9 || (Math.abs(bf - af) < 1e-9 && bl > al))) ? b : a;
+    });
+  }
+
+  // Lens sweep: for each stock lens, cameras needed for square volumes from 1.5 m up to what the room allows.
+  function sweep(sensor, o, sizes) {
+    return STOCK.map((f) => {
+      // Sizes run smallest first; once a lens fails at one size, larger ones are treated as failing too.
+      let failed = false;
+      const ns = sizes.map((L) => {
+        if (failed) return null;
+        const r = solve(sensor, f, Object.assign({}, o, { volW: L, volD: L }), 13, 12, true);
+        if (!r.ok) failed = true;
+        return r.ok ? r.n : null;
+      });
+      return { f, orient: o.orient, ns };
+    });
+  }
+
+  function pickLens(rows) {
+    // Most sizes solved first, then fewest total cameras, then the longer lens (more pixels).
+    // A lens that solves no size is no better for being long: of those the shortest wins, which fits a body closest.
+    const score = (r) => { const solved = r.ns.filter((x) => x != null); return [solved.length, -solved.reduce((a, b) => a + b, 0), solved.length ? r.f : -r.f]; };
+    // Ties beyond that go to landscape (listed first), which covers more width.
+    return rows.slice().sort((a, b) => { const A = score(a), B = score(b); for (let i = 0; i < 3; i++) if (A[i] !== B[i]) return B[i] - A[i]; return 0; })[0];
+  }
+
+  return { P, SENSORS, STOCK, STRAIGHT, REAR, BLOCK, CAP, GAP, AHEAD, optics, evaluate, solve, plan, withN, ahead, choose, sweep, pickLens };
+})();
+if (typeof module !== "undefined") module.exports = ENGINE;

@@ -1,0 +1,14 @@
+{
+  "name": "mocap-lens-calc",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Lens and camera-count planner for a low-cost markerless motion capture rig (AR0234 / OV9281 USB cameras).",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "node dev.js",
+    "test": "node build.js && node tests/engine.test.js && node tests/page.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "24.1.3"
+  }
+}
