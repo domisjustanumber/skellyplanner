@@ -12,8 +12,8 @@
 // Auto since 17 Nov 2026 (eleventh change): a layout with a face-on camera first, then a score, covered + back seen / 2 + hands
 // tracked / 4 at the cameras asked. The 4x4 room, 3x2 volume test (a lens covering 72% beat one covering 69%) became the score test
 // with the 5x5 room case; a face-on check and a 2-camera check were added. No other engine pin moved.
-const assert = require("assert");
-const E = require("../src/engine.js");
+import assert from "node:assert";
+import * as E from "../src/engine.js";
 
 const base = { crop: 256, ph: 1.8, cov: 2.2, minA: 45, maxA: 120, need: 1 };
 const room = (w, L, extra = {}) => Object.assign({}, base, { roomW: w, roomD: w, volW: L, volD: L, orient: "landscape" }, extra);

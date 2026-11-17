@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>FreeMoCap room planner</title>
+    <!-- ?theme=dark or ?theme=light forces a theme (the docs site sets data-theme the same way); otherwise the OS setting -->
+    <script>
+      {
+        const theme = new URLSearchParams(location.search).get("theme");
+        if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
+      }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+    <!-- linked here rather than imported in main.js, so main.js also loads in node for the page test -->
+    <link rel="stylesheet" href="/src/styles.css">
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>FreeMoCap room planner</h1>
+        <p>Enter your room and how many cameras you have. The map shows where to put them.</p>
+      </header>
+
+      <div class="grid">
+        <div class="panel">
+          <form id="calc" onsubmit="return false">
+            <fieldset>
+              <legend>Room</legend>
+              <div class="two">
+                <label class="field"><span>Room width (m)</span><input type="number" id="roomW" min="2" max="30" step="0.1" value="6"></label>
+                <label class="field"><span>Room depth (m)</span><input type="number" id="roomD" min="2" max="30" step="0.1" value="6"></label>
+                <label class="field"><span>Capture width (m)</span><input type="number" id="volW" min="0.5" max="25" step="0.1" value="3"></label>
+                <label class="field"><span>Capture depth (m)</span><input type="number" id="volD" min="0.5" max="25" step="0.1" value="3"></label>
+              </div>
+              <p class="hint">Capture space: the area the person moves in.</p>
+            </fieldset>
+
+            <fieldset>
+              <div class="focal-row"><span>How far the person turns</span><output id="turn-out">0°</output></div>
+              <input type="range" id="turn" min="0" max="360" step="90" value="0" list="turn-stops" aria-label="How far the person turns, in degrees">
+              <datalist id="turn-stops"><option value="0"></option><option value="90"></option><option value="180"></option><option value="270"></option><option value="360"></option></datalist>
+              <div class="stops" aria-hidden="true"><span>0°</span><span>90°</span><span>180°</span><span>270°</span><span>360°</span></div>
+              <p class="hint">0° = always faces the front wall.</p>
+            </fieldset>
+
+            <fieldset>
+              <div class="focal-row"><span>Cameras you have</span><output id="cams-out">6</output></div>
+              <input type="range" id="cams" min="2" max="20" step="1" value="6" aria-label="Number of cameras you have">
+            </fieldset>
+
+            <fieldset>
+              <legend>Camera sensor</legend>
+              <div class="seg" role="radiogroup" aria-label="Camera sensor">
+                <input type="radio" name="sensor" id="s-ar" value="ar0234" checked><label for="s-ar">AR0234</label>
+                <input type="radio" name="sensor" id="s-ov" value="ov9281"><label for="s-ov">OV9281</label>
+              </div>
+            </fieldset>
+
+            <details class="advanced">
+              <summary>Advanced</summary>
+              <fieldset>
+                <legend>Lens</legend>
+                <label class="field"><span>AR0234 lens<small>Auto picks the best</small></span><select id="lensAR"></select></label>
+                <label class="field"><span>OV9281 lens<small>Auto picks the best</small></span><select id="lensOV"></select></label>
+              </fieldset>
+              <fieldset>
+                <legend>Placement</legend>
+                <label class="field"><span>Gap to front wall<small>m; blank = automatic</small></span><input type="number" id="gap" min="0.2" max="25" step="0.1" placeholder="auto"></label>
+              </fieldset>
+              <fieldset>
+                <legend>Person size</legend>
+                <label class="field"><span>Height<small>m</small></span><input type="number" id="ph" min="0.5" max="2.5" step="0.05" value="1.8"></label>
+                <label class="field"><span>Height in frame<small>m, person plus margin</small></span><input type="number" id="cov" min="0.5" max="4" step="0.05" value="2.2"></label>
+              </fieldset>
+              <fieldset>
+                <legend>Pose model</legend>
+                <div class="seg" role="radiogroup" aria-label="Pixels the pose model needs">
+                  <input type="radio" name="crop" id="c-256" value="256" checked><label for="c-256">256 px</label>
+                  <input type="radio" name="crop" id="c-384" value="384"><label for="c-384">384 px</label>
+                </div>
+                <p class="hint">How tall a person must be in the image. 256 for most models.</p>
+              </fieldset>
+              <fieldset>
+                <legend>Coverage</legend>
+                <label class="field"><span>Min angle<small>degrees between two cameras</small></span><input type="number" id="minA" min="0" max="180" step="5" value="30"></label>
+                <label class="field"><span>Max angle<small>degrees between two cameras</small></span><input type="number" id="maxA" min="0" max="180" step="5" value="120"></label>
+                <label class="field"><span>Target<small>% of the capture space</small></span><input type="number" id="need" min="50" max="100" step="1" value="100"></label>
+              </fieldset>
+            </details>
+          </form>
+        </div>
+
+        <div class="results" id="results">
+          <div class="panel">
+            <h2 id="map-title">Camera layout</h2>
+            <div class="map">
+              <div>
+                <svg id="map" viewBox="0 0 400 400" role="img" aria-label="Floor plan of the room, capture space, cameras and coverage"></svg>
+                <div class="legend">
+                  <span><i class="sw" style="background:var(--ok)"></i>Hands behind back tracked</span>
+                  <span><i class="sw sw-small"></i>Back seen</span>
+                  <span><i class="sw sw-ring"></i>Covered</span>
+                  <span><i class="sw" style="background:var(--warn)"></i>Too few cameras</span>
+                  <span><i class="sw" style="background:var(--bad)"></i>Not seen</span>
+                </div>
+              </div>
+              <div>
+                <div class="table-wrap"><table id="camtab"></table></div>
+                <p class="caption" id="map-cap"></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="verdict" id="r-verdict" aria-live="polite"><span class="pill" id="r-pill"></span><p id="r-text"></p></div>
+
+          <details class="panel more">
+            <summary>More or fewer cameras</summary>
+            <div class="table-wrap"><table id="ntab"></table></div>
+            <p class="caption">Share of the capture space each number of cameras covers. Highlighted: the cameras you have.</p>
+          </details>
+        </div>
+      </div>
+
+      <div class="notes">
+        <p>The map is seen from above. It does not show camera height or furniture, and it plans for one person. Mounting cameras a little above head height, angled down, helps when people block each other.</p>
+        <p>Cheap wide lenses bend the image near the edges, so real coverage is a little wider than shown.</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

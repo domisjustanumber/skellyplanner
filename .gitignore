@@ -3,3 +3,4 @@ node_modules/
 *.rej
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+dist/

@@ -1,14 +1,17 @@
 {
-  "name": "mocap-lens-calc",
-  "version": "0.4.0",
+  "name": "skellyplanner",
+  "version": "0.5.0",
   "private": true,
-  "description": "Lens and camera-count planner for a low-cost markerless motion capture rig (AR0234 / OV9281 USB cameras).",
+  "type": "module",
+  "description": "FreeMoCap room planner: where to put the cameras for a low-cost markerless motion capture rig (AR0234 / OV9281 USB cameras).",
   "scripts": {
-    "build": "node build.js",
-    "dev": "node dev.js",
-    "test": "node build.js && node tests/engine.test.js && node tests/page.test.js"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node tests/engine.test.js && node tests/page.test.js"
   },
   "devDependencies": {
-    "jsdom": "24.1.3"
+    "jsdom": "24.1.3",
+    "vite": "^8.3.8"
   }
 }

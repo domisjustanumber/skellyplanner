@@ -1,4 +1,4 @@
-// Coverage engine for the room planner. Pure functions; used by the page and by node tests.
+// Coverage engine for the room planner. Pure functions, no DOM; an ES module used by the page, its plan worker, tests/ and tools/.
 const ENGINE = (() => {
   const P = 0.003; // mm pixel pitch
   const SENSORS = { ar0234: { name: "AR0234", w: 1920, h: 1200 }, ov9281: { name: "OV9281", w: 1280, h: 800 } };
@@ -241,7 +241,10 @@ const ENGINE = (() => {
         const th = pth[q], n = vn[q], b = q * cap, mL = pm[l], mR = pm[r], mB = T2 ? pr[q] : 0;
         let nL = 0, nR = 0, nP = 0;
         for (let v = b; v < b + n; v++) {
-          if (inBand(th, vth[v])) { nL |= mL & vm[v * 2]; nR |= mR & vm[v * 2 + 1]; if (T3) nP |= mB & vr[v]; }
+          let d = th - vth[v];   // inBand(), written out: this is the hottest loop of a plan
+          if (d < 0) d = -d;
+          if (d > 180) d = 360 - d;
+          if (d >= lo && d <= hi) { nL |= mL & vm[v * 2]; nR |= mR & vm[v * 2 + 1]; if (T3) nP |= mB & vr[v]; }
         }
         nL &= ~cov[l]; nR &= ~cov[r]; nP &= ~rp[q];
         const ms = c.p.st[q];
@@ -739,4 +742,4 @@ const ENGINE = (() => {
 
   return { P, SENSORS, STOCK, STRAIGHT, REAR, BLOCK, CAP, GAP, AHEAD, optics, evaluate, solve, plan, withN, ahead, choose, sweep, pickLens };
 })();
-if (typeof module !== "undefined") module.exports = ENGINE;
+export const { P, SENSORS, STOCK, STRAIGHT, REAR, BLOCK, CAP, GAP, AHEAD, optics, evaluate, solve, plan, withN, ahead, choose, sweep, pickLens } = ENGINE;

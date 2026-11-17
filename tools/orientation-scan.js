@@ -1,4 +1,4 @@
-const E=require('../src/engine.js');
+import * as E from '../src/engine.js';
 let wins=[];
 for (const crop of [256,384]) for (const room of [3.5,4,5,6,8]) for (const sk of ['ar0234','ov9281']) {
   const sizes=[];for(let L=1.5;L<=room-1+1e-9;L+=0.5)sizes.push(L); if(!sizes.length) continue;
