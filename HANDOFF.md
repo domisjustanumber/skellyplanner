@@ -311,3 +311,5 @@ Best single lens per room: 5 m → AR 2.5 / OV 2.1; 6 m → AR 2.8 / OV 2.5; 8 m
 - Export a setup sheet for the chosen sensor: camera angles, distances from centre and from the volume edge, plus aim point (the camera table on the map already has the numbers).
 - Optional unit prices so "cheapest" can be ranked by cost rather than count.
 - Camera height and vertical field-of-view check for jumps and raised arms (Walker's failure case).
+
+- Publishing: .github/workflows/deploy.yml deploys dist/ to GitHub Pages on push to main (https://domisjustanumber.github.io/skellyplanner/); vite `base: "./"` for the sub-path. Pages source must be set to "GitHub Actions" in repo settings.

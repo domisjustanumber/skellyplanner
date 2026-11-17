@@ -3,6 +3,7 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  base: "./", // relative asset URLs: works at /skellyplanner/ on GitHub Pages and inside another site
   worker: { format: "es" },
   clearScreen: false
 });

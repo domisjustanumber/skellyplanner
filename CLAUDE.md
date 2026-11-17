@@ -47,4 +47,6 @@ node tools/orientation-scan.js   # where portrait beats landscape
 
 ## Running and publishing
 
+Pushes to `main` deploy to GitHub Pages (https://domisjustanumber.github.io/skellyplanner/) via `.github/workflows/deploy.yml` (npm ci, test, build, upload dist). `base: "./"` in `vite.config.js` keeps asset URLs relative for the sub-path.
+
 There is no published copy any more (the claude.ai Artifact is retired). The page runs from the Vite dev server: `npm run dev`, then open http://localhost:5173. It is meant to be merged into docs.freemocap.org, a Docusaurus 3 site; `npm run build` gives the static files for that (dist/), with the plan worker as its own asset.
